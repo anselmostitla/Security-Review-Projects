@@ -19,4 +19,13 @@ contract TokenFactoryTest is Test {
         address tokenAddress = tokenFactory.deployToken("TEST", type(L1Token).creationCode);
         assertEq(tokenFactory.getTokenAddressFromSymbol("TEST"), tokenAddress);
     }
+
+    function testAddTokenWithSameSymbol() public {
+        vm.startPrank(owner);
+        address tokenAddress = tokenFactory.deployToken("TEST", type(L1Token).creationCode);
+        assertEq(tokenFactory.getTokenAddressFromSymbol("TEST"), tokenAddress);
+
+        address tokenAddress2 = tokenFactory.deployToken("TEST", type(L1Token).creationCode);
+        assertEq(tokenFactory.getTokenAddressFromSymbol("TEST"), tokenAddress2);
+    }
 }
