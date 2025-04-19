@@ -27,11 +27,15 @@ import { L1Vault } from "./L1Vault.sol";
 contract L1BossBridge is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    // @audit-info should be constant!
     uint256 public DEPOSIT_LIMIT = 100_000 ether;
 
     IERC20 public immutable token;
     L1Vault public immutable vault;
     mapping(address account => bool isSigner) public signers;
+    
+    // // new code
+    // mapping(address user => uint256 depositedAmount) public deposits;
 
     error L1BossBridge__DepositLimitReached();
     error L1BossBridge__Unauthorized();
@@ -55,6 +59,8 @@ contract L1BossBridge is Ownable, Pausable, ReentrancyGuard {
     }
 
     function setSigner(address account, bool enabled) external onlyOwner {
+        // @audit require(account != address(0))
+        // @audit require(signers[account] = !enabled;)
         signers[account] = enabled;
     }
 
@@ -67,13 +73,24 @@ contract L1BossBridge is Ownable, Pausable, ReentrancyGuard {
      * @param l2Recipient The address of the user who will receive the tokens on L2
      * @param amount The amount of tokens to deposit
      */
+    // @audit Impact high, likelihood: high, 
+    // if alice approves the bridge, any other user can steal their funcds
     function depositTokensToL2(address from, address l2Recipient, uint256 amount) external whenNotPaused {
+        // @audit inputs validations
+        // if amount > 0 saves gas for the user
         if (token.balanceOf(address(vault)) + amount > DEPOSIT_LIMIT) {
             revert L1BossBridge__DepositLimitReached();
         }
+        
+        // audit keep track of deposit tokens of msg.sender for example using a mapping: deposits[token][msg.sender] += amount;
+        
+        // // new code
+        // deposits[msg.sender] += amount; 
+
         token.safeTransferFrom(from, address(vault), amount);
 
         // Our off-chain service picks up this event and mints the corresponding tokens on L2
+        // @audit-info should follow CEI
         emit Deposit(from, l2Recipient, amount);
     }
 
@@ -89,6 +106,8 @@ contract L1BossBridge is Ownable, Pausable, ReentrancyGuard {
      * @param s The s value of the signature
      */
     function withdrawTokensToL1(address to, uint256 amount, uint8 v, bytes32 r, bytes32 s) external {
+        // @audit require(to != address(0)) to avoid burning tokens accidentally;
+        // @audit require(msg.sender == to);
         sendToL1(
             v,
             r,
@@ -109,18 +128,41 @@ contract L1BossBridge is Ownable, Pausable, ReentrancyGuard {
      * @param s The s value of the signature
      * @param message The message/data to be sent to L1 (can be blank)
      */
+    // @audit make this function internal
     function sendToL1(uint8 v, bytes32 r, bytes32 s, bytes memory message) public nonReentrant whenNotPaused {
         address signer = ECDSA.recover(MessageHashUtils.toEthSignedMessageHash(keccak256(message)), v, r, s);
 
+        // @audit q we need a mechanism like a mapping to mark a (v,r,s) as used so that nobody can used again
         if (!signers[signer]) {
             revert L1BossBridge__Unauthorized();
         }
 
+
         (address target, uint256 value, bytes memory data) = abi.decode(message, (address, uint256, bytes));
 
+        // // new code
+        // (, address to, uint256 amount) = decodeTransferFrom(data);
+        // require(deposits[to] >= amount);
+        // deposits[msg.sender] -= amount; 
+
+        // @audit-gas data with crazy gas cost
         (bool success,) = target.call{ value: value }(data);
         if (!success) {
             revert L1BossBridge__CallFailed();
         }
+    }
+
+    function decodeTransferFrom(bytes memory callData) public pure returns (
+        address from,
+        address to,
+        uint256 amount
+    ) {
+        // Copy everything except the first 4 bytes (selector)
+        bytes memory args = new bytes(callData.length - 4);
+        for (uint256 i = 0; i < args.length; ++i) {
+            args[i] = callData[i + 4];
+        }
+
+        return abi.decode(args, (address, address, uint256));
     }
 }
